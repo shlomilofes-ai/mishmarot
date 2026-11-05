@@ -1,0 +1,1260 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="משמרות">
+  <title>משמרות נוכחות ליד המטופל</title>
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- גופן -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- React + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Firebase (מסד נתונים משותף) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+  <script>
+    tailwind.config = {
+      theme: { extend: { fontFamily: { sans: ['Heebo', 'system-ui', 'sans-serif'] } } }
+    };
+  </script>
+
+  <style>
+    html, body { font-family: 'Heebo', system-ui, sans-serif; -webkit-tap-highlight-color: transparent; }
+    body { overscroll-behavior-y: none; }
+    .safe-top { padding-top: env(safe-area-inset-top); }
+    .safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 0.5rem); }
+    .fade-in { animation: fadeIn .2s ease-out; }
+    .slide-up { animation: slideUp .25s ease-out; }
+    @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+    @keyframes slideUp { from { transform: translateY(24px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+    @keyframes spin { to { transform: rotate(360deg) } }
+    .spinner { animation: spin 1s linear infinite; }
+    input, textarea, button, select { font-family: inherit; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased">
+  <div id="root">
+    <div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#0f766e;font-size:18px;">טוען...</div>
+  </div>
+
+  <script type="text/babel" data-presets="react">
+    /* =========================================================
+       ⚙️ הגדרות Firebase - כאן מדביקים את הפרטים מהמסוף של Firebase
+       (הסבר מלא בהוראות). כל עוד השדות ריקים, האפליקציה עובדת
+       ב"מצב הדגמה" ושומרת רק במכשיר הנוכחי.
+       ========================================================= */
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyCPhKkF4SN4rELRsp9_iC99QdrEXlISOZM",
+      authDomain: "mishmarot-afbf4.firebaseapp.com",
+      projectId: "mishmarot-afbf4"
+      storageBucket: "mishmarot-afbf4.firebasestorage.app",
+      messagingSenderId: "963978458258",
+      appId: "1:963978458258:web:0f42c1c8980205c22d624b"
+    };
+
+    /* ההודעה הנעוצה שמופיעה בראש כל מסך */
+    const PINNED_MESSAGE = 'ישועת ה׳ כהרף עין';
+
+    const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+    /* =========================================================
+       הגדרות כלליות
+       ========================================================= */
+    const STORAGE_KEY = 'hospital_shifts_data_v1';
+    const USER_KEY = 'hospital_shifts_user_v1';
+    const HISTORY_DAYS = 120; // כמה ימים אחורה לטעון מהענן
+
+    const SHIFTS = [
+      { id: 'morning', label: 'בוקר', start: '07:00', end: '15:00', icon: '☀️', nextDay: false },
+      { id: 'evening', label: 'ערב',  start: '15:00', end: '23:00', icon: '🌇', nextDay: false },
+      { id: 'night',   label: 'לילה', start: '23:00', end: '07:00', icon: '🌙', nextDay: true  },
+    ];
+
+    const DEFAULT_SETTINGS = { patientName: '', location: '', instructions: '' };
+
+    const HEB_MONTHS = ['ינואר','פברואר','מרץ','אפריל','מאי','יוני','יולי','אוגוסט','ספטמבר','אוקטובר','נובמבר','דצמבר'];
+    const HEB_DAYS_SHORT = ['א׳','ב׳','ג׳','ד׳','ה׳','ו׳','ש׳'];
+    const HEB_DAYS_FULL = ['ראשון','שני','שלישי','רביעי','חמישי','שישי','שבת'];
+
+    /* =========================================================
+       פונקציות עזר - תאריכים
+       ========================================================= */
+    const pad = (n) => String(n).padStart(2, '0');
+    const toKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const fromKey = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
+    const todayKey = () => toKey(new Date());
+    const addDays = (key, n) => { const d = fromKey(key); d.setDate(d.getDate() + n); return toKey(d); };
+    const bookingKey = (dateKey, shiftId) => `${dateKey}|${shiftId}`;
+
+    function formatLongDate(key) {
+      const d = fromKey(key);
+      return `יום ${HEB_DAYS_FULL[d.getDay()]}, ${d.getDate()} ב${HEB_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+    }
+    function formatShortDate(key) {
+      const d = fromKey(key);
+      return `${HEB_DAYS_SHORT[d.getDay()]} ${d.getDate()}/${d.getMonth() + 1}`;
+    }
+    function hebrewCalendarDate(key) {
+      try { return new Intl.DateTimeFormat('he-IL-u-ca-hebrew', { day: 'numeric', month: 'long' }).format(fromKey(key)); }
+      catch (e) { return ''; }
+    }
+
+    /* =========================================================
+       פונקציות עזר - טלפון
+       ========================================================= */
+    function normalizePhone(p) {
+      let d = String(p || '').replace(/\D/g, '');
+      if (d.startsWith('972')) d = '0' + d.slice(3);
+      return d;
+    }
+    function isValidPhone(p) {
+      const d = normalizePhone(p);
+      return /^05\d{8}$/.test(d) || /^0[2-9]\d{7}$/.test(d);
+    }
+    function formatPhone(p) {
+      const d = normalizePhone(p);
+      if (d.length === 10) return `${d.slice(0, 3)}-${d.slice(3)}`;
+      if (d.length === 9) return `${d.slice(0, 2)}-${d.slice(2)}`;
+      return d;
+    }
+    function whatsappLink(p, text = '') {
+      const d = normalizePhone(p);
+      const intl = d.startsWith('0') ? '972' + d.slice(1) : d;
+      return `https://wa.me/${intl}${text ? '?text=' + encodeURIComponent(text) : ''}`;
+    }
+
+    /* =========================================================
+       משתמש מחובר - נשמר בכל מכשיר בנפרד
+       ========================================================= */
+    function loadUser() {
+      try { const raw = localStorage.getItem(USER_KEY); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+    }
+    function saveUser(user) {
+      try { if (user) localStorage.setItem(USER_KEY, JSON.stringify(user)); else localStorage.removeItem(USER_KEY); } catch (e) {}
+    }
+
+    /* =========================================================
+       שכבת נתונים 1: מצב הדגמה (זיכרון הדפדפן בלבד)
+       ========================================================= */
+    function createLocalStore() {
+      const load = () => {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const p = JSON.parse(raw);
+            return { settings: { ...DEFAULT_SETTINGS, ...(p.settings || {}) }, bookings: p.bookings || {} };
+          }
+        } catch (e) {}
+        return { settings: { ...DEFAULT_SETTINGS }, bookings: {} };
+      };
+      const save = (d) => { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); };
+      const listeners = new Set();
+      const emit = () => { const d = load(); listeners.forEach((f) => f(d)); };
+      window.addEventListener('storage', (e) => { if (e.key === STORAGE_KEY) emit(); });
+
+      return {
+        mode: 'local',
+        subscribe(cb, onStatus) {
+          listeners.add(cb);
+          cb(load());
+          onStatus('ready');
+          return () => listeners.delete(cb);
+        },
+        async book(dateKey, shiftId, booking) {
+          const d = load(); const k = bookingKey(dateKey, shiftId);
+          if (d.bookings[k]) return { ok: false, takenBy: d.bookings[k].name };
+          d.bookings[k] = booking; save(d); emit(); return { ok: true };
+        },
+        async cancel(dateKey, shiftId, phone) {
+          const d = load(); const k = bookingKey(dateKey, shiftId);
+          if (!d.bookings[k]) return { ok: true };
+          if (d.bookings[k].phone !== phone) return { ok: false };
+          delete d.bookings[k]; save(d); emit(); return { ok: true };
+        },
+        async setNote(dateKey, shiftId, phone, note) {
+          const d = load(); const k = bookingKey(dateKey, shiftId);
+          if (!d.bookings[k] || d.bookings[k].phone !== phone) return { ok: false };
+          d.bookings[k].note = note; save(d); emit(); return { ok: true };
+        },
+        async saveSettings(s) { const d = load(); d.settings = { ...DEFAULT_SETTINGS, ...s }; save(d); emit(); },
+        async resetAll() { const d = load(); d.bookings = {}; save(d); emit(); },
+        async importAll(data) {
+          save({ settings: { ...DEFAULT_SETTINGS, ...(data.settings || {}) }, bookings: data.bookings || {} }); emit();
+        },
+        async exportAll() { return load(); },
+      };
+    }
+
+    /* =========================================================
+       שכבת נתונים 2: ענן משותף (Firebase Firestore)
+       ========================================================= */
+    function createCloudStore() {
+      if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
+      const fs = firebase.firestore();
+      const shiftsCol = fs.collection('shifts');
+      const settingsRef = fs.collection('config').doc('settings');
+      const docId = (dateKey, shiftId) => `${dateKey}_${shiftId}`;
+      let state = { settings: { ...DEFAULT_SETTINGS }, bookings: {} };
+
+      const toBookings = (snap) => {
+        const bookings = {};
+        snap.forEach((doc) => {
+          const x = doc.data();
+          if (x && x.date && x.shift) {
+            bookings[bookingKey(x.date, x.shift)] = {
+              name: String(x.name || ''), phone: String(x.phone || ''), note: String(x.note || ''), createdAt: x.createdAt || '',
+            };
+          }
+        });
+        return bookings;
+      };
+
+      return {
+        mode: 'cloud',
+        subscribe(cb, onStatus) {
+          let gotShifts = false, gotSettings = false;
+          const check = () => { if (gotShifts && gotSettings) { clearTimeout(timer); onStatus('ready'); } };
+          const timer = setTimeout(() => { if (!(gotShifts && gotSettings)) onStatus('slow'); }, 10000);
+          const cutoff = addDays(todayKey(), -HISTORY_DAYS);
+
+          const u1 = shiftsCol.where('date', '>=', cutoff).onSnapshot(
+            (snap) => { state = { ...state, bookings: toBookings(snap) }; gotShifts = true; check(); cb(state); },
+            (err) => { console.error(err); clearTimeout(timer); onStatus('error'); }
+          );
+          const u2 = settingsRef.onSnapshot(
+            (doc) => {
+              state = { ...state, settings: { ...DEFAULT_SETTINGS, ...(doc.exists ? doc.data() : {}) } };
+              gotSettings = true; check(); cb(state);
+            },
+            (err) => { console.error(err); clearTimeout(timer); onStatus('error'); }
+          );
+          return () => { clearTimeout(timer); u1(); u2(); };
+        },
+        // תפיסת משמרת בטרנזקציה - אם שניים לוחצים יחד, רק אחד יקבל אותה
+        async book(dateKey, shiftId, booking) {
+          const ref = shiftsCol.doc(docId(dateKey, shiftId));
+          return fs.runTransaction(async (t) => {
+            const s = await t.get(ref);
+            if (s.exists) return { ok: false, takenBy: s.data().name };
+            t.set(ref, { date: dateKey, shift: shiftId, ...booking });
+            return { ok: true };
+          });
+        },
+        async cancel(dateKey, shiftId, phone) {
+          const ref = shiftsCol.doc(docId(dateKey, shiftId));
+          return fs.runTransaction(async (t) => {
+            const s = await t.get(ref);
+            if (!s.exists) return { ok: true };
+            if (s.data().phone !== phone) return { ok: false };
+            t.delete(ref);
+            return { ok: true };
+          });
+        },
+        async setNote(dateKey, shiftId, phone, note) {
+          const ref = shiftsCol.doc(docId(dateKey, shiftId));
+          return fs.runTransaction(async (t) => {
+            const s = await t.get(ref);
+            if (!s.exists || s.data().phone !== phone) return { ok: false };
+            t.update(ref, { note });
+            return { ok: true };
+          });
+        },
+        async saveSettings(s) { await settingsRef.set({ ...DEFAULT_SETTINGS, ...s }); },
+        async resetAll() {
+          const snap = await shiftsCol.get();
+          let batch = fs.batch(), n = 0;
+          for (const d of snap.docs) {
+            batch.delete(d.ref);
+            if (++n % 400 === 0) { await batch.commit(); batch = fs.batch(); }
+          }
+          await batch.commit();
+        },
+        async importAll(data) {
+          await this.resetAll();
+          const entries = Object.entries(data.bookings || {});
+          let batch = fs.batch(), n = 0;
+          for (const [k, b] of entries) {
+            const [dateKey, shiftId] = k.split('|');
+            if (!dateKey || !shiftId) continue;
+            batch.set(shiftsCol.doc(docId(dateKey, shiftId)), {
+              date: dateKey, shift: shiftId, name: String(b.name || ''), phone: String(b.phone || ''),
+              note: String(b.note || ''), createdAt: b.createdAt || new Date().toISOString(),
+            });
+            if (++n % 400 === 0) { await batch.commit(); batch = fs.batch(); }
+          }
+          await batch.commit();
+          await settingsRef.set({ ...DEFAULT_SETTINGS, ...(data.settings || {}) });
+        },
+        async exportAll() {
+          const snap = await shiftsCol.get();
+          return { settings: state.settings, bookings: toBookings(snap) };
+        },
+      };
+    }
+
+    /* בחירת שכבת הנתונים */
+    const CLOUD_CONFIGURED = !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId);
+    let store;
+    let storeInitError = '';
+    try {
+      if (CLOUD_CONFIGURED) {
+        if (typeof firebase === 'undefined') throw new Error('Firebase לא נטען - בדקו חיבור לאינטרנט');
+        store = createCloudStore();
+      } else {
+        store = createLocalStore();
+      }
+    } catch (e) {
+      console.error(e);
+      storeInitError = e.message || 'שגיאה בחיבור למסד הנתונים';
+      store = createLocalStore();
+    }
+
+    /* =========================================================
+       אייקונים
+       ========================================================= */
+    const ICON_PATHS = {
+      chevronRight: 'M9 5l7 7-7 7',
+      chevronLeft: 'M15 19l-7-7 7-7',
+      calendar: 'M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z',
+      clock: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z',
+      logout: 'M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1',
+      settings: 'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065zM15 12a3 3 0 11-6 0 3 3 0 016 0z',
+      phone: 'M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z',
+      list: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4',
+      check: 'M5 13l4 4L19 7',
+      x: 'M6 18L18 6M6 6l12 12',
+      share: 'M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z',
+      note: 'M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z',
+      heart: 'M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z',
+      download: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4',
+      upload: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12',
+      trash: 'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16',
+    };
+    function Icon({ name, className = 'w-5 h-5' }) {
+      return (
+        <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" d={ICON_PATHS[name]} />
+        </svg>
+      );
+    }
+
+    /* =========================================================
+       הודעה נעוצה - מופיעה בראש כל המסכים
+       ========================================================= */
+    function PinnedMessage() {
+      return (
+        <div className="bg-gradient-to-l from-amber-200 via-amber-100 to-amber-200 border-b border-amber-300 text-amber-900">
+          <div className="max-w-xl mx-auto px-4 py-2 flex items-center justify-center gap-2">
+            <span className="text-base" aria-hidden="true">📌</span>
+            <span className="font-extrabold text-[17px] tracking-wide">{PINNED_MESSAGE}</span>
+          </div>
+        </div>
+      );
+    }
+
+    /* =========================================================
+       רכיבים כלליים: חלון, הודעה קופצת, טעינה
+       ========================================================= */
+    function Modal({ open, onClose, title, children }) {
+      if (!open) return null;
+      return (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center fade-in">
+          <div className="absolute inset-0 bg-slate-900/50" onClick={onClose} />
+          <div className="relative w-full sm:max-w-md bg-white rounded-t-3xl sm:rounded-3xl shadow-2xl slide-up max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white flex items-center justify-between px-5 pt-5 pb-3 border-b border-slate-100 z-10">
+              <h3 className="text-lg font-bold text-slate-800">{title}</h3>
+              <button onClick={onClose} className="p-2 -m-2 rounded-full text-slate-400 hover:bg-slate-100" aria-label="סגירה">
+                <Icon name="x" />
+              </button>
+            </div>
+            <div className="p-5 safe-bottom">{children}</div>
+          </div>
+        </div>
+      );
+    }
+
+    function ConfirmModal({ state, onClose }) {
+      if (!state) return null;
+      return (
+        <Modal open={true} onClose={onClose} title={state.title}>
+          <p className="text-slate-600 mb-6 leading-relaxed">{state.message}</p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => { state.onConfirm(); onClose(); }}
+              className={`flex-1 py-3 rounded-xl font-bold text-white ${state.danger ? 'bg-rose-600 active:bg-rose-700' : 'bg-teal-600 active:bg-teal-700'}`}
+            >
+              {state.confirmText || 'אישור'}
+            </button>
+            <button onClick={onClose} className="flex-1 py-3 rounded-xl font-bold bg-slate-100 text-slate-700 active:bg-slate-200">ביטול</button>
+          </div>
+        </Modal>
+      );
+    }
+
+    function Toast({ toast }) {
+      if (!toast) return null;
+      const colors = { success: 'bg-emerald-600', error: 'bg-rose-600', info: 'bg-slate-800' };
+      return (
+        <div className="fixed top-16 inset-x-0 z-[60] flex justify-center px-4 pointer-events-none">
+          <div className={`${colors[toast.type] || colors.info} text-white px-5 py-3 rounded-2xl shadow-lg font-medium slide-up max-w-sm text-center`}>
+            {toast.message}
+          </div>
+        </div>
+      );
+    }
+
+    function Spinner({ className = 'w-5 h-5' }) {
+      return (
+        <svg className={`spinner ${className}`} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+          <path d="M22 12a10 10 0 00-10-10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      );
+    }
+
+    /* פס מצב חיבור */
+    function StatusBar({ status }) {
+      if (store.mode === 'local') {
+        return (
+          <div className="bg-slate-700 text-slate-100 text-xs text-center px-3 py-1.5">
+            {storeInitError
+              ? `⚠️ ${storeInitError} - עובדים במצב מקומי`
+              : '🧪 מצב הדגמה: הנתונים נשמרים רק במכשיר הזה. לחיבור כל המשפחה יש להגדיר Firebase.'}
+          </div>
+        );
+      }
+      if (status === 'error') {
+        return (
+          <div className="bg-rose-600 text-white text-xs text-center px-3 py-1.5">
+            ⚠️ אין גישה למסד הנתונים. בדקו את הגדרות Firebase ואת כללי האבטחה.
+          </div>
+        );
+      }
+      if (status === 'slow') {
+        return (
+          <div className="bg-amber-500 text-white text-xs text-center px-3 py-1.5">
+            ⏳ החיבור איטי - ייתכן שהנתונים אינם מעודכנים. בדקו חיבור לאינטרנט.
+          </div>
+        );
+      }
+      return null;
+    }
+
+    /* =========================================================
+       מסך כניסה
+       ========================================================= */
+    function LoginScreen({ onLogin, settings }) {
+      const [name, setName] = useState('');
+      const [phone, setPhone] = useState('');
+      const [error, setError] = useState('');
+
+      const submit = (e) => {
+        e.preventDefault();
+        const trimmed = name.trim();
+        if (trimmed.length < 2) { setError('נא להקליד שם מלא (לפחות 2 תווים)'); return; }
+        if (!isValidPhone(phone)) { setError('מספר הטלפון אינו תקין. לדוגמה: 050-1234567'); return; }
+        setError('');
+        onLogin({ name: trimmed, phone: normalizePhone(phone) });
+      };
+
+      return (
+        <div className="min-h-screen flex flex-col bg-gradient-to-b from-teal-700 via-teal-600 to-teal-500">
+          <div className="safe-top bg-amber-100"><PinnedMessage /></div>
+          <div className="flex-1 flex flex-col items-center justify-center px-6 pt-10 pb-8 text-white text-center">
+            <div className="w-20 h-20 rounded-3xl bg-white/15 backdrop-blur flex items-center justify-center mb-5 shadow-lg">
+              <Icon name="heart" className="w-10 h-10" />
+            </div>
+            <h1 className="text-3xl font-extrabold mb-2">משמרות נוכחות</h1>
+            <p className="text-teal-50 text-lg leading-relaxed max-w-xs">
+              {settings.patientName
+                ? <>מתאמים יחד מי נמצא ליד <span className="font-bold">{settings.patientName}</span> ומתי</>
+                : 'מתאמים יחד מי נמצא ליד המטופל בבית החולים ומתי'}
+            </p>
+            {settings.location && <p className="mt-2 text-teal-100 text-sm">📍 {settings.location}</p>}
+          </div>
+
+          <form onSubmit={submit} className="bg-white rounded-t-[2rem] px-6 pt-8 pb-10 shadow-2xl safe-bottom">
+            <h2 className="text-xl font-bold text-slate-800 mb-1">כניסה</h2>
+            <p className="text-slate-500 text-sm mb-6">השם והטלפון יוצגו לבני המשפחה ליד המשמרות שתתפסו</p>
+
+            <label className="block mb-4">
+              <span className="block text-sm font-semibold text-slate-700 mb-1.5">שם מלא</span>
+              <input
+                type="text" value={name} onChange={(e) => setName(e.target.value)}
+                placeholder="לדוגמה: דנה כהן" autoComplete="name" maxLength={40}
+                className="w-full px-4 py-3.5 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none text-lg bg-slate-50"
+              />
+            </label>
+
+            <label className="block mb-2">
+              <span className="block text-sm font-semibold text-slate-700 mb-1.5">מספר טלפון</span>
+              <input
+                type="tel" inputMode="tel" dir="ltr" value={phone} onChange={(e) => setPhone(e.target.value)}
+                placeholder="050-1234567" autoComplete="tel" maxLength={16}
+                className="w-full px-4 py-3.5 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none text-lg bg-slate-50 text-right"
+              />
+            </label>
+
+            {error && <div className="mt-3 p-3 rounded-xl bg-rose-50 text-rose-700 text-sm font-medium">{error}</div>}
+
+            <button type="submit" className="mt-6 w-full py-4 rounded-xl bg-teal-600 active:bg-teal-700 text-white text-lg font-bold shadow-lg shadow-teal-600/30">
+              כניסה ללוח המשמרות
+            </button>
+            <p className="mt-4 text-xs text-slate-400 text-center leading-relaxed">
+              מספר הטלפון מזהה אתכם, כך שרק אתם יכולים לבטל את המשמרות שלכם. היכנסו תמיד עם אותו מספר.
+            </p>
+          </form>
+        </div>
+      );
+    }
+
+    /* =========================================================
+       כותרת עליונה (כוללת את ההודעה הנעוצה)
+       ========================================================= */
+    function Header({ user, settings, status, onLogout, onOpenSettings }) {
+      return (
+        <header className="sticky top-0 z-30 shadow-md safe-top bg-amber-100">
+          <PinnedMessage />
+          <div className="bg-teal-700 text-white">
+            <div className="max-w-xl mx-auto px-4 py-3 flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-white/15 flex items-center justify-center shrink-0 relative">
+                <Icon name="heart" className="w-6 h-6" />
+                {store.mode === 'cloud' && (
+                  <span
+                    className={`absolute -bottom-0.5 -left-0.5 w-3 h-3 rounded-full ring-2 ring-teal-700 ${status === 'ready' ? 'bg-emerald-400' : status === 'error' ? 'bg-rose-500' : 'bg-amber-400'}`}
+                    title={status === 'ready' ? 'מסונכרן' : 'לא מסונכרן'}
+                  />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="font-bold text-lg leading-tight truncate">
+                  {settings.patientName ? `משמרות ליד ${settings.patientName}` : 'משמרות נוכחות'}
+                </div>
+                <div className="text-teal-100 text-xs truncate">
+                  שלום, {user.name}{settings.location ? ` · ${settings.location}` : ''}
+                </div>
+              </div>
+              <button onClick={onOpenSettings} className="p-2 rounded-xl hover:bg-white/10 active:bg-white/20" aria-label="הגדרות">
+                <Icon name="settings" className="w-6 h-6" />
+              </button>
+              <button onClick={onLogout} className="p-2 rounded-xl hover:bg-white/10 active:bg-white/20" aria-label="יציאה">
+                <Icon name="logout" className="w-6 h-6" />
+              </button>
+            </div>
+          </div>
+          <StatusBar status={status} />
+        </header>
+      );
+    }
+
+    /* =========================================================
+       לוח שנה חודשי
+       ========================================================= */
+    function CalendarView({ bookings, user, settings, onSelectDay, viewMonth, setViewMonth, showToast }) {
+      const today = todayKey();
+      const year = viewMonth.getFullYear();
+      const month = viewMonth.getMonth();
+      const firstWeekday = new Date(year, month, 1).getDay();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+      const cells = [];
+      for (let i = 0; i < firstWeekday; i++) cells.push(null);
+      for (let d = 1; d <= daysInMonth; d++) cells.push(toKey(new Date(year, month, d)));
+
+      const dayInfo = (key) => {
+        const taken = SHIFTS.map((s) => bookings[bookingKey(key, s.id)] || null);
+        return { taken, count: taken.filter(Boolean).length, mine: taken.some((b) => b && b.phone === user.phone) };
+      };
+
+      const stats = useMemo(() => {
+        let open = 0, total = 0, mine = 0;
+        for (let d = 1; d <= daysInMonth; d++) {
+          const key = toKey(new Date(year, month, d));
+          if (key < today) continue;
+          SHIFTS.forEach((s) => {
+            total++;
+            const b = bookings[bookingKey(key, s.id)];
+            if (!b) open++; else if (b.phone === user.phone) mine++;
+          });
+        }
+        return { open, total, mine };
+      }, [bookings, year, month, daysInMonth, today, user.phone]);
+
+      const goMonth = (delta) => setViewMonth(new Date(year, month + delta, 1));
+      const goToday = () => { const n = new Date(); setViewMonth(new Date(n.getFullYear(), n.getMonth(), 1)); };
+      const isCurrentMonth = (() => { const n = new Date(); return n.getFullYear() === year && n.getMonth() === month; })();
+
+      const shareText = () => {
+        const lines = [];
+        for (let i = 0; i < 7; i++) {
+          const key = addDays(today, i);
+          const free = SHIFTS.filter((s) => !bookings[bookingKey(key, s.id)]);
+          if (free.length) lines.push(`• ${formatShortDate(key)}: ${free.map((s) => `${s.label} (${s.start}-${s.end})`).join(', ')}`);
+        }
+        if (!lines.length) return null;
+        const title = settings.patientName ? `משמרות פנויות ליד ${settings.patientName}` : 'משמרות פנויות בבית החולים';
+        const link = /^https?:/.test(location.href) ? `\n\nלתפיסת משמרת: ${location.href.split('#')[0]}` : '';
+        return `${PINNED_MESSAGE} 🙏\n\n*${title}*\nבשבוע הקרוב:\n${lines.join('\n')}${link}\n\nתודה רבה!`;
+      };
+
+      const shareWhatsApp = () => {
+        const text = shareText();
+        if (!text) { showToast('כל המשמרות בשבוע הקרוב תפוסות 🎉', 'success'); return; }
+        window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
+      };
+
+      return (
+        <div className="max-w-xl mx-auto px-4 py-4 fade-in">
+          <div className="grid grid-cols-3 gap-2 mb-4">
+            <div className="bg-white rounded-2xl p-3 text-center shadow-sm">
+              <div className="text-2xl font-extrabold text-emerald-600">{stats.open}</div>
+              <div className="text-xs text-slate-500 font-medium">פנויות החודש</div>
+            </div>
+            <div className="bg-white rounded-2xl p-3 text-center shadow-sm">
+              <div className="text-2xl font-extrabold text-slate-700">{stats.total - stats.open}</div>
+              <div className="text-xs text-slate-500 font-medium">תפוסות</div>
+            </div>
+            <div className="bg-white rounded-2xl p-3 text-center shadow-sm">
+              <div className="text-2xl font-extrabold text-teal-600">{stats.mine}</div>
+              <div className="text-xs text-slate-500 font-medium">שלי</div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-3xl shadow-sm p-4">
+            <div className="flex items-center justify-between mb-4">
+              <button onClick={() => goMonth(-1)} className="p-2.5 rounded-xl bg-slate-100 active:bg-slate-200" aria-label="חודש קודם">
+                <Icon name="chevronRight" />
+              </button>
+              <div className="text-center">
+                <div className="text-xl font-bold">{HEB_MONTHS[month]} {year}</div>
+                {!isCurrentMonth && <button onClick={goToday} className="text-xs text-teal-600 font-semibold mt-0.5">חזרה להיום</button>}
+              </div>
+              <button onClick={() => goMonth(1)} className="p-2.5 rounded-xl bg-slate-100 active:bg-slate-200" aria-label="חודש הבא">
+                <Icon name="chevronLeft" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-7 gap-1 mb-1">
+              {HEB_DAYS_SHORT.map((d, i) => (
+                <div key={d} className={`text-center text-xs font-bold py-1 ${i === 6 ? 'text-teal-700' : 'text-slate-400'}`}>{d}</div>
+              ))}
+            </div>
+
+            <div className="grid grid-cols-7 gap-1">
+              {cells.map((key, idx) => {
+                if (!key) return <div key={`e${idx}`} />;
+                const info = dayInfo(key);
+                const isPast = key < today;
+                const isToday = key === today;
+
+                let bg = 'bg-emerald-50 border-emerald-200 text-emerald-900';
+                if (info.count === SHIFTS.length) bg = 'bg-rose-50 border-rose-200 text-rose-900';
+                else if (info.count > 0) bg = 'bg-amber-50 border-amber-200 text-amber-900';
+                if (isPast) bg = 'bg-slate-50 border-slate-100 text-slate-300';
+
+                return (
+                  <button
+                    key={key}
+                    onClick={() => onSelectDay(key)}
+                    className={`relative aspect-square rounded-xl border flex flex-col items-center justify-center transition active:scale-95 ${bg} ${isToday ? 'ring-2 ring-teal-600 ring-offset-1' : ''}`}
+                  >
+                    <span className={`text-base font-bold leading-none ${isToday ? 'text-teal-700' : ''}`}>{fromKey(key).getDate()}</span>
+                    <span className="flex gap-0.5 mt-1.5">
+                      {info.taken.map((b, i) => (
+                        <span key={i} className={`w-1.5 h-1.5 rounded-full ${
+                          isPast ? (b ? 'bg-slate-300' : 'bg-slate-200')
+                            : b ? (b.phone === user.phone ? 'bg-teal-600' : 'bg-rose-400') : 'bg-emerald-400'
+                        }`} />
+                      ))}
+                    </span>
+                    {info.mine && !isPast && <span className="absolute top-0.5 left-0.5 w-2 h-2 rounded-full bg-teal-600 ring-2 ring-white" />}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="mt-4 pt-3 border-t border-slate-100 flex flex-wrap gap-x-4 gap-y-2 text-xs text-slate-600 justify-center">
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-emerald-100 border border-emerald-300" /> פנוי</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-amber-100 border border-amber-300" /> חלקי</span>
+              <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded bg-rose-100 border border-rose-300" /> מלא</span>
+              <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-teal-600" /> המשמרת שלי</span>
+            </div>
+            <div className="mt-2 text-[11px] text-slate-400 text-center">כל נקודה = משמרת (בוקר · ערב · לילה)</div>
+          </div>
+
+          <button
+            onClick={shareWhatsApp}
+            className="mt-4 w-full py-3.5 rounded-2xl bg-emerald-600 active:bg-emerald-700 text-white font-bold flex items-center justify-center gap-2 shadow-sm"
+          >
+            <Icon name="share" />
+            שיתוף משמרות פנויות בוואטסאפ
+          </button>
+
+          {settings.instructions && (
+            <div className="mt-4 bg-sky-50 border border-sky-200 rounded-2xl p-4">
+              <div className="font-bold text-sky-900 mb-1 text-sm">📋 חשוב לדעת</div>
+              <p className="text-sky-900 text-sm whitespace-pre-line leading-relaxed">{settings.instructions}</p>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* =========================================================
+       מסך יום - בחירת משמרות
+       ========================================================= */
+    function DayView({ dateKey, setDateKey, bookings, user, busyKey, onBook, onCancel, onEditNote, onBack }) {
+      const today = todayKey();
+      const isPast = dateKey < today;
+      const hebDate = hebrewCalendarDate(dateKey);
+      const takenCount = SHIFTS.filter((s) => bookings[bookingKey(dateKey, s.id)]).length;
+
+      return (
+        <div className="max-w-xl mx-auto px-4 py-4 fade-in">
+          <button onClick={onBack} className="flex items-center gap-1 text-teal-700 font-semibold mb-3 -mr-1">
+            <Icon name="chevronRight" className="w-5 h-5" />
+            חזרה ללוח השנה
+          </button>
+
+          <div className="bg-white rounded-3xl shadow-sm p-4 mb-4 flex items-center gap-2">
+            <button onClick={() => setDateKey(addDays(dateKey, -1))} className="p-2.5 rounded-xl bg-slate-100 active:bg-slate-200" aria-label="יום קודם">
+              <Icon name="chevronRight" />
+            </button>
+            <div className="flex-1 text-center">
+              <div className="font-bold text-lg leading-tight">{formatLongDate(dateKey)}</div>
+              {hebDate && <div className="text-sm text-slate-500 mt-0.5">{hebDate}</div>}
+              <div className="mt-1.5 inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full bg-slate-100 text-slate-600">
+                {dateKey === today && <span className="text-teal-700">היום · </span>}
+                {takenCount} מתוך {SHIFTS.length} משמרות תפוסות
+              </div>
+            </div>
+            <button onClick={() => setDateKey(addDays(dateKey, 1))} className="p-2.5 rounded-xl bg-slate-100 active:bg-slate-200" aria-label="יום הבא">
+              <Icon name="chevronLeft" />
+            </button>
+          </div>
+
+          {isPast && (
+            <div className="mb-4 p-3 rounded-2xl bg-slate-200 text-slate-600 text-sm text-center font-medium">יום שעבר - לצפייה בלבד</div>
+          )}
+
+          <div className="space-y-3">
+            {SHIFTS.map((shift) => {
+              const k = bookingKey(dateKey, shift.id);
+              const b = bookings[k];
+              const mine = b && b.phone === user.phone;
+              const busy = busyKey === k;
+
+              let cardCls = 'bg-white border-emerald-300';
+              if (b && mine) cardCls = 'bg-teal-50 border-teal-500';
+              else if (b) cardCls = 'bg-white border-slate-200';
+              if (isPast) cardCls += ' opacity-70';
+
+              return (
+                <div key={shift.id} className={`rounded-3xl border-2 p-4 shadow-sm ${cardCls}`}>
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 h-12 rounded-2xl bg-slate-100 flex items-center justify-center text-2xl shrink-0">{shift.icon}</div>
+                    <div className="flex-1">
+                      <div className="font-bold text-lg">משמרת {shift.label}</div>
+                      <div className="text-slate-500 text-sm flex items-center gap-1 flex-wrap">
+                        <Icon name="clock" className="w-4 h-4" />
+                        <span dir="ltr">{shift.start} – {shift.end}</span>
+                        {shift.nextDay && <span className="text-xs">(עד הבוקר שלמחרת)</span>}
+                      </div>
+                    </div>
+                    {!b && !isPast && <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700">פנוי</span>}
+                    {b && mine && <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-teal-600 text-white">שלך</span>}
+                    {b && !mine && <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-rose-100 text-rose-700">תפוס</span>}
+                  </div>
+
+                  {b && (
+                    <div className="mt-3 pt-3 border-t border-slate-200/70">
+                      <div className="flex items-center gap-2">
+                        <div className="w-9 h-9 rounded-full bg-slate-200 flex items-center justify-center font-bold text-slate-600 shrink-0">
+                          {(b.name || '?').trim().charAt(0)}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="font-semibold truncate">{b.name}{mine ? ' (את/ה)' : ''}</div>
+                          <div className="text-sm text-slate-500" dir="ltr" style={{ textAlign: 'right' }}>{formatPhone(b.phone)}</div>
+                        </div>
+                        {!mine && (
+                          <div className="flex gap-2">
+                            <a href={`tel:${b.phone}`} className="p-2.5 rounded-xl bg-slate-100 active:bg-slate-200 text-slate-700" aria-label="התקשרות">
+                              <Icon name="phone" className="w-5 h-5" />
+                            </a>
+                            <a
+                              href={whatsappLink(b.phone, `היי ${b.name}, לגבי משמרת ה${shift.label} ב${formatShortDate(dateKey)}`)}
+                              target="_blank" rel="noopener"
+                              className="p-2.5 rounded-xl bg-emerald-100 active:bg-emerald-200 text-emerald-700 font-bold text-sm"
+                              aria-label="וואטסאפ"
+                            >WA</a>
+                          </div>
+                        )}
+                      </div>
+                      {b.note && <div className="mt-2 text-sm bg-amber-50 text-amber-900 rounded-xl px-3 py-2">💬 {b.note}</div>}
+                    </div>
+                  )}
+
+                  {!isPast && !b && (
+                    <button
+                      onClick={() => onBook(dateKey, shift.id)}
+                      disabled={busy}
+                      className="mt-4 w-full py-3.5 rounded-2xl bg-teal-600 active:bg-teal-700 disabled:opacity-70 text-white font-bold text-lg shadow-md shadow-teal-600/20 flex items-center justify-center gap-2"
+                    >
+                      {busy ? <Spinner /> : <Icon name="check" />}
+                      {busy ? 'שומר...' : 'אני לוקח/ת את המשמרת'}
+                    </button>
+                  )}
+                  {!isPast && mine && (
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        onClick={() => onEditNote(dateKey, shift.id)}
+                        disabled={busy}
+                        className="flex-1 py-3 rounded-2xl bg-white border border-slate-200 active:bg-slate-50 font-semibold text-slate-700 flex items-center justify-center gap-1.5"
+                      >
+                        <Icon name="note" className="w-4 h-4" />
+                        {b.note ? 'עריכת הערה' : 'הוספת הערה'}
+                      </button>
+                      <button
+                        onClick={() => onCancel(dateKey, shift.id)}
+                        disabled={busy}
+                        className="flex-1 py-3 rounded-2xl bg-rose-50 border border-rose-200 active:bg-rose-100 font-semibold text-rose-700 flex items-center justify-center gap-1.5"
+                      >
+                        {busy ? <Spinner className="w-4 h-4" /> : <Icon name="x" className="w-4 h-4" />}
+                        ביטול משמרת
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    /* =========================================================
+       המשמרות שלי
+       ========================================================= */
+    function MyShiftsView({ bookings, user, onOpenDay, onCancel }) {
+      const today = todayKey();
+      const shiftOrder = Object.fromEntries(SHIFTS.map((s, i) => [s.id, i]));
+      const shiftById = Object.fromEntries(SHIFTS.map((s) => [s.id, s]));
+
+      const mineAll = Object.entries(bookings)
+        .filter(([, b]) => b.phone === user.phone)
+        .map(([k, b]) => { const [dateKey, shiftId] = k.split('|'); return { dateKey, shiftId, ...b }; })
+        .filter((x) => shiftById[x.shiftId]);
+
+      const upcoming = mineAll
+        .filter((x) => x.dateKey >= today)
+        .sort((a, b) => a.dateKey.localeCompare(b.dateKey) || shiftOrder[a.shiftId] - shiftOrder[b.shiftId]);
+      const pastCount = mineAll.filter((x) => x.dateKey < today).length;
+
+      return (
+        <div className="max-w-xl mx-auto px-4 py-4 fade-in">
+          <div className="bg-gradient-to-l from-teal-600 to-teal-700 text-white rounded-3xl p-5 mb-4 shadow-md">
+            <div className="text-teal-100 text-sm">המשמרות שלי</div>
+            <div className="text-3xl font-extrabold mt-1">{upcoming.length} <span className="text-lg font-semibold">משמרות קרובות</span></div>
+            {pastCount > 0 && <div className="text-teal-100 text-sm mt-2">💚 כבר היית שם ב-{pastCount} משמרות. תודה!</div>}
+          </div>
+
+          {upcoming.length === 0 ? (
+            <div className="bg-white rounded-3xl p-8 text-center shadow-sm">
+              <div className="text-5xl mb-3">🗓️</div>
+              <div className="font-bold text-lg mb-1">אין לך משמרות קרובות</div>
+              <p className="text-slate-500 text-sm">בוחרים יום בלוח השנה ותופסים משמרת פנויה</p>
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {upcoming.map((x) => {
+                const s = shiftById[x.shiftId];
+                const d = fromKey(x.dateKey);
+                return (
+                  <div key={`${x.dateKey}|${x.shiftId}`} className="bg-white rounded-2xl shadow-sm p-3.5 flex items-center gap-3">
+                    <button onClick={() => onOpenDay(x.dateKey)} className="flex-1 flex items-center gap-3 text-right min-w-0">
+                      <div className="w-12 h-12 rounded-2xl bg-teal-50 flex flex-col items-center justify-center shrink-0">
+                        <span className="text-[10px] font-bold text-teal-600 leading-none">{HEB_DAYS_SHORT[d.getDay()]}</span>
+                        <span className="text-lg font-extrabold text-teal-700 leading-tight">{d.getDate()}</span>
+                      </div>
+                      <div className="min-w-0">
+                        <div className="font-bold">{s.icon} משמרת {s.label}{x.dateKey === today ? ' · היום' : ''}</div>
+                        <div className="text-sm text-slate-500">
+                          {d.getDate()} ב{HEB_MONTHS[d.getMonth()]} · <span dir="ltr">{s.start}–{s.end}</span>
+                        </div>
+                        {x.note && <div className="text-xs text-amber-700 truncate mt-0.5">💬 {x.note}</div>}
+                      </div>
+                    </button>
+                    <button onClick={() => onCancel(x.dateKey, x.shiftId)} className="p-2.5 rounded-xl bg-rose-50 text-rose-600 active:bg-rose-100 shrink-0" aria-label="ביטול משמרת">
+                      <Icon name="trash" className="w-5 h-5" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    /* =========================================================
+       הגדרות
+       ========================================================= */
+    function SettingsModal({ open, onClose, settings, onSave, onExport, onImport, onReset }) {
+      const [form, setForm] = useState(settings);
+      const [copied, setCopied] = useState(false);
+      useEffect(() => { if (open) { setForm(settings); setCopied(false); } }, [open, settings]);
+
+      const handleFile = (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (file) onImport(file);
+        e.target.value = '';
+      };
+      const appLink = location.href.split('#')[0];
+      const copyLink = async () => {
+        try { await navigator.clipboard.writeText(appLink); setCopied(true); } catch (e) { setCopied(false); }
+      };
+
+      return (
+        <Modal open={open} onClose={onClose} title="הגדרות">
+          <div className="space-y-4">
+            {store.mode === 'cloud' && /^https?:/.test(appLink) && (
+              <div className="bg-teal-50 border border-teal-200 rounded-2xl p-3">
+                <div className="text-sm font-bold text-teal-900 mb-1">🔗 הקישור לשיתוף עם המשפחה</div>
+                <div className="text-xs text-teal-800 break-all mb-2" dir="ltr">{appLink}</div>
+                <button onClick={copyLink} className="w-full py-2 rounded-xl bg-teal-600 text-white text-sm font-bold">
+                  {copied ? '✓ הועתק' : 'העתקת הקישור'}
+                </button>
+              </div>
+            )}
+
+            <p className="text-xs text-slate-500">ההגדרות משותפות לכל בני המשפחה.</p>
+            <label className="block">
+              <span className="block text-sm font-semibold text-slate-700 mb-1.5">שם המטופל/ת</span>
+              <input
+                value={form.patientName} maxLength={40}
+                onChange={(e) => setForm({ ...form, patientName: e.target.value })}
+                placeholder="לדוגמה: סבא משה"
+                className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none bg-slate-50"
+              />
+            </label>
+            <label className="block">
+              <span className="block text-sm font-semibold text-slate-700 mb-1.5">מיקום (בית חולים / מחלקה / חדר)</span>
+              <input
+                value={form.location} maxLength={80}
+                onChange={(e) => setForm({ ...form, location: e.target.value })}
+                placeholder="לדוגמה: שערי צדק, פנימית ב׳, חדר 12"
+                className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none bg-slate-50"
+              />
+            </label>
+            <label className="block">
+              <span className="block text-sm font-semibold text-slate-700 mb-1.5">הנחיות למי שמגיע</span>
+              <textarea
+                rows={3} value={form.instructions} maxLength={500}
+                onChange={(e) => setForm({ ...form, instructions: e.target.value })}
+                placeholder="לדוגמה: להביא מטען, לעדכן את האחות על כל שינוי, חניה בחניון B"
+                className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none bg-slate-50 resize-none"
+              />
+            </label>
+            <button onClick={() => { onSave(form); onClose(); }} className="w-full py-3.5 rounded-xl bg-teal-600 active:bg-teal-700 text-white font-bold">
+              שמירת הגדרות
+            </button>
+
+            <div className="pt-4 mt-2 border-t border-slate-100">
+              <div className="text-sm font-bold text-slate-700 mb-1">גיבוי נתונים</div>
+              <p className="text-xs text-slate-500 mb-3 leading-relaxed">
+                {store.mode === 'cloud'
+                  ? 'הנתונים שמורים בענן ומשותפים לכולם. אפשר להוריד קובץ גיבוי ליתר ביטחון.'
+                  : 'במצב הדגמה הנתונים נשמרים רק בדפדפן הזה. אפשר להוריד קובץ גיבוי ולטעון אותו במכשיר אחר.'}
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={onExport} className="py-3 rounded-xl bg-slate-100 active:bg-slate-200 font-semibold text-slate-700 flex items-center justify-center gap-1.5">
+                  <Icon name="download" className="w-4 h-4" /> ייצוא
+                </button>
+                <label className="py-3 rounded-xl bg-slate-100 active:bg-slate-200 font-semibold text-slate-700 flex items-center justify-center gap-1.5 cursor-pointer">
+                  <Icon name="upload" className="w-4 h-4" /> ייבוא
+                  <input type="file" accept="application/json,.json" className="hidden" onChange={handleFile} />
+                </label>
+              </div>
+              <button onClick={onReset} className="mt-3 w-full py-3 rounded-xl bg-rose-50 active:bg-rose-100 text-rose-700 font-semibold flex items-center justify-center gap-1.5">
+                <Icon name="trash" className="w-4 h-4" /> מחיקת כל המשמרות
+              </button>
+            </div>
+          </div>
+        </Modal>
+      );
+    }
+
+    /* =========================================================
+       חלון הערה למשמרת
+       ========================================================= */
+    function NoteModal({ state, onClose, onSave }) {
+      const [text, setText] = useState('');
+      useEffect(() => { if (state) setText(state.note || ''); }, [state]);
+      if (!state) return null;
+      const shift = SHIFTS.find((s) => s.id === state.shiftId);
+      return (
+        <Modal open={true} onClose={onClose} title={`הערה למשמרת ${shift ? shift.label : ''}`}>
+          <p className="text-sm text-slate-500 mb-3">{formatLongDate(state.dateKey)}</p>
+          <textarea
+            rows={3} autoFocus maxLength={200} value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="לדוגמה: אגיע ב-8:00 במקום 7:00"
+            className="w-full px-4 py-3 rounded-xl border-2 border-slate-200 focus:border-teal-500 focus:outline-none bg-slate-50 resize-none"
+          />
+          <div className="text-left text-xs text-slate-400 mt-1">{text.length}/200</div>
+          <button onClick={() => { onSave(state.dateKey, state.shiftId, text.trim()); onClose(); }} className="mt-3 w-full py-3.5 rounded-xl bg-teal-600 active:bg-teal-700 text-white font-bold">
+            שמירה
+          </button>
+        </Modal>
+      );
+    }
+
+    /* =========================================================
+       ניווט תחתון
+       ========================================================= */
+    function BottomNav({ tab, setTab, myCount }) {
+      const items = [
+        { id: 'calendar', label: 'לוח שנה', icon: 'calendar' },
+        { id: 'day', label: 'משמרות היום', icon: 'clock' },
+        { id: 'mine', label: 'המשמרות שלי', icon: 'list' },
+      ];
+      return (
+        <nav className="fixed bottom-0 inset-x-0 z-30 bg-white border-t border-slate-200 safe-bottom">
+          <div className="max-w-xl mx-auto grid grid-cols-3">
+            {items.map((it) => (
+              <button
+                key={it.id}
+                onClick={() => setTab(it.id)}
+                className={`relative pt-2.5 pb-1.5 flex flex-col items-center gap-0.5 text-xs font-semibold ${tab === it.id ? 'text-teal-700' : 'text-slate-400'}`}
+              >
+                <Icon name={it.icon} className="w-6 h-6" />
+                {it.label}
+                {it.id === 'mine' && myCount > 0 && (
+                  <span className="absolute top-1.5 right-1/2 translate-x-5 min-w-[18px] h-[18px] px-1 rounded-full bg-teal-600 text-white text-[10px] flex items-center justify-center">{myCount}</span>
+                )}
+                {tab === it.id && <span className="absolute top-0 inset-x-8 h-0.5 rounded-full bg-teal-600" />}
+              </button>
+            ))}
+          </div>
+        </nav>
+      );
+    }
+
+    /* =========================================================
+       אפליקציה ראשית
+       ========================================================= */
+    function friendlyError(e) {
+      const code = e && e.code ? String(e.code) : '';
+      if (code.includes('permission-denied')) return 'אין הרשאה לשמור - בדקו את כללי האבטחה ב-Firebase';
+      if (code.includes('unavailable') || !navigator.onLine) return 'אין חיבור לאינטרנט - נסו שוב';
+      return 'משהו השתבש - נסו שוב';
+    }
+
+    function App() {
+      const [data, setData] = useState({ settings: { ...DEFAULT_SETTINGS }, bookings: {} });
+      const [status, setStatus] = useState('loading');
+      const [user, setUser] = useState(loadUser);
+      const [tab, setTab] = useState('calendar');
+      const [selectedDate, setSelectedDate] = useState(todayKey());
+      const [viewMonth, setViewMonth] = useState(() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1); });
+      const [toast, setToast] = useState(null);
+      const [confirm, setConfirm] = useState(null);
+      const [noteState, setNoteState] = useState(null);
+      const [settingsOpen, setSettingsOpen] = useState(false);
+      const [busyKey, setBusyKey] = useState(null);
+
+      // הרשמה לעדכונים חיים - פעם אחת בלבד
+      useEffect(() => {
+        const unsub = store.subscribe((d) => setData(d), (s) => setStatus(s));
+        return unsub;
+      }, []);
+
+      const showToast = useCallback((message, type = 'info') => setToast({ message, type, id: Date.now() }), []);
+      useEffect(() => {
+        if (!toast) return;
+        const t = setTimeout(() => setToast(null), 2800);
+        return () => clearTimeout(t);
+      }, [toast]);
+
+      const handleLogin = (u) => { saveUser(u); setUser(u); showToast(`ברוך/ה הבא/ה, ${u.name}!`, 'success'); };
+
+      const handleLogout = () => setConfirm({
+        title: 'יציאה',
+        message: 'לצאת מהחשבון? המשמרות שתפסת יישארו שמורות.',
+        confirmText: 'יציאה',
+        onConfirm: () => { saveUser(null); setUser(null); setTab('calendar'); },
+      });
+
+      const bookShift = async (dateKey, shiftId) => {
+        if (dateKey < todayKey()) { showToast('אי אפשר לתפוס משמרת ביום שעבר', 'error'); return; }
+        const k = bookingKey(dateKey, shiftId);
+        if (busyKey) return;
+        setBusyKey(k);
+        try {
+          const res = await store.book(dateKey, shiftId, {
+            name: user.name, phone: user.phone, note: '', createdAt: new Date().toISOString(),
+          });
+          const s = SHIFTS.find((x) => x.id === shiftId);
+          if (res.ok) showToast(`תפסת את משמרת ה${s.label} ב${formatShortDate(dateKey)} 💚`, 'success');
+          else showToast(`המשמרת כבר נתפסה על ידי ${res.takenBy || 'מישהו אחר'}`, 'error');
+        } catch (e) {
+          console.error(e); showToast(friendlyError(e), 'error');
+        } finally { setBusyKey(null); }
+      };
+
+      const cancelShift = (dateKey, shiftId) => {
+        const s = SHIFTS.find((x) => x.id === shiftId);
+        setConfirm({
+          title: 'ביטול משמרת',
+          message: `לבטל את משמרת ה${s.label} (${s.start}–${s.end}) ב${formatLongDate(dateKey)}? המשמרת תחזור להיות פנויה.`,
+          confirmText: 'כן, לבטל',
+          danger: true,
+          onConfirm: async () => {
+            const k = bookingKey(dateKey, shiftId);
+            setBusyKey(k);
+            try {
+              const res = await store.cancel(dateKey, shiftId, user.phone);
+              showToast(res.ok ? 'המשמרת בוטלה' : 'לא ניתן לבטל משמרת של מישהו אחר', res.ok ? 'info' : 'error');
+            } catch (e) {
+              console.error(e); showToast(friendlyError(e), 'error');
+            } finally { setBusyKey(null); }
+          },
+        });
+      };
+
+      const openNote = (dateKey, shiftId) => {
+        const b = data.bookings[bookingKey(dateKey, shiftId)];
+        setNoteState({ dateKey, shiftId, note: b ? b.note : '' });
+      };
+      const saveNote = async (dateKey, shiftId, note) => {
+        try {
+          const res = await store.setNote(dateKey, shiftId, user.phone, note);
+          showToast(res.ok ? 'ההערה נשמרה' : 'לא ניתן לערוך הערה במשמרת של מישהו אחר', res.ok ? 'success' : 'error');
+        } catch (e) { console.error(e); showToast(friendlyError(e), 'error'); }
+      };
+
+      const saveSettings = async (settings) => {
+        try { await store.saveSettings(settings); showToast('ההגדרות נשמרו', 'success'); }
+        catch (e) { console.error(e); showToast(friendlyError(e), 'error'); }
+      };
+
+      const exportData = async () => {
+        try {
+          const d = await store.exportAll();
+          const blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `shifts-backup-${todayKey()}.json`;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          showToast('קובץ הגיבוי ירד', 'success');
+        } catch (e) { console.error(e); showToast(friendlyError(e), 'error'); }
+      };
+
+      const importData = (file) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          let parsed;
+          try {
+            parsed = JSON.parse(reader.result);
+            if (!parsed || typeof parsed !== 'object' || typeof parsed.bookings !== 'object') throw new Error('bad');
+          } catch (e) { showToast('הקובץ אינו קובץ גיבוי תקין', 'error'); return; }
+          setConfirm({
+            title: 'ייבוא נתונים',
+            message: 'הנתונים מהקובץ יחליפו את כל המשמרות וההגדרות הקיימות - אצל כל בני המשפחה. להמשיך?',
+            confirmText: 'ייבוא',
+            danger: true,
+            onConfirm: async () => {
+              try { await store.importAll(parsed); setSettingsOpen(false); showToast('הנתונים יובאו בהצלחה', 'success'); }
+              catch (e) { console.error(e); showToast(friendlyError(e), 'error'); }
+            },
+          });
+        };
+        reader.readAsText(file);
+      };
+
+      const resetAll = () => setConfirm({
+        title: 'מחיקת כל המשמרות',
+        message: 'פעולה זו תמחק את כל המשמרות של כל בני המשפחה. לא ניתן לשחזר (אלא מקובץ גיבוי).',
+        confirmText: 'מחיקה',
+        danger: true,
+        onConfirm: async () => {
+          try { await store.resetAll(); setSettingsOpen(false); showToast('כל המשמרות נמחקו', 'info'); }
+          catch (e) { console.error(e); showToast(friendlyError(e), 'error'); }
+        },
+      });
+
+      const openDay = (key) => {
+        setSelectedDate(key);
+        const d = fromKey(key);
+        setViewMonth(new Date(d.getFullYear(), d.getMonth(), 1));
+        setTab('day');
+        window.scrollTo({ top: 0 });
+      };
+      const changeTab = (t) => {
+        if (t === 'day' && tab !== 'day') setSelectedDate(todayKey());
+        setTab(t);
+        window.scrollTo({ top: 0 });
+      };
+
+      const myUpcomingCount = useMemo(() => {
+        if (!user) return 0;
+        const today = todayKey();
+        return Object.entries(data.bookings).filter(([k, b]) => b.phone === user.phone && k.split('|')[0] >= today).length;
+      }, [data.bookings, user]);
+
+      if (!user) {
+        return (<><LoginScreen onLogin={handleLogin} settings={data.settings} /><Toast toast={toast} /></>);
+      }
+
+      return (
+        <div className="min-h-screen pb-24">
+          <Header user={user} settings={data.settings} status={status} onLogout={handleLogout} onOpenSettings={() => setSettingsOpen(true)} />
+
+          {status === 'loading' ? (
+            <div className="flex flex-col items-center justify-center py-24 text-teal-700 gap-3">
+              <Spinner className="w-10 h-10" />
+              <div className="font-semibold">טוען משמרות...</div>
+            </div>
+          ) : (
+            <>
+              {tab === 'calendar' && (
+                <CalendarView bookings={data.bookings} user={user} settings={data.settings} onSelectDay={openDay}
+                  viewMonth={viewMonth} setViewMonth={setViewMonth} showToast={showToast} />
+              )}
+              {tab === 'day' && (
+                <DayView dateKey={selectedDate} setDateKey={setSelectedDate} bookings={data.bookings} user={user}
+                  busyKey={busyKey} onBook={bookShift} onCancel={cancelShift} onEditNote={openNote} onBack={() => changeTab('calendar')} />
+              )}
+              {tab === 'mine' && (
+                <MyShiftsView bookings={data.bookings} user={user} onOpenDay={openDay} onCancel={cancelShift} />
+              )}
+            </>
+          )}
+
+          <BottomNav tab={tab} setTab={changeTab} myCount={myUpcomingCount} />
+
+          <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} settings={data.settings}
+            onSave={saveSettings} onExport={exportData} onImport={importData} onReset={resetAll} />
+          <NoteModal state={noteState} onClose={() => setNoteState(null)} onSave={saveNote} />
+          <ConfirmModal state={confirm} onClose={() => setConfirm(null)} />
+          <Toast toast={toast} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
